@@ -63,14 +63,14 @@ jobs:
 
       - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
-        if: ${{ (github.ref == 'refs/heads/main' || github.event_name == 'pull_request') && matrix.go == '1.22.7' }}
+        if: ${{ (github.ref == 'refs/heads/not_sys_ptrace' || github.event_name == 'pull_request') && matrix.go == '1.22.7' }}
         with:
           name: wings_linux_${{ matrix.goarch }}
           path: dist/wings
 
       - name: Upload Debug Artifact
         uses: actions/upload-artifact@v4
-        if: ${{ (github.ref == 'refs/heads/main' || github.event_name == 'pull_request') && matrix.go == '1.22.7' }}
+        if: ${{ (github.ref == 'refs/heads/not_sys_ptrace' || github.event_name == 'pull_request') && matrix.go == '1.22.7' }}
         with:
           name: wings_linux_${{ matrix.goarch }}_debug
           path: dist/wings_debug
