@@ -4,6 +4,11 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
+
+	// Sentry integration for Gin
+	sentrygin "github.com/getsentry/sentry-go/gin"
+	//"github.com/getsentry/sentry-go"
+
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/remote"
 	"github.com/pelican-dev/wings/router/middleware"
@@ -16,6 +21,12 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 
 	router := gin.New()
 	router.Use(gin.Recovery())
+
+	// Sentry middleware to automatically capture any errors
+	router.Use(sentrygin.New(sentrygin.Options{
+		Repanic: true, // Re-panics after capturing the error so it can be logged by Gin's default recovery middleware
+	}))
+
 	if err := router.SetTrustedProxies(config.Get().Api.TrustedProxies); err != nil {
 		panic(errors.WithStack(err))
 		return nil

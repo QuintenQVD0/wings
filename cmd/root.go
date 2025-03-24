@@ -26,6 +26,8 @@ import (
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 
+	sentry "github.com/getsentry/sentry-go"
+
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
 	"github.com/pelican-dev/wings/internal/cron"
@@ -117,6 +119,15 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		log.Error("Docker Snap installation detected. Exiting...")
 		os.Exit(1)
 	}
+
+	err := sentry.Init(sentry.ClientOptions{
+		Dsn: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		Debug: config.Get().Debug,
+	})
+	if err != nil {
+		log.Fatalf("sentry.Init: %s", err)
+	}
+	defer sentry.Flush(2 * time.Second)
 
 	if ok, _ := cmd.Flags().GetBool("ignore-certificate-errors"); ok {
 		log.Warn("running with --ignore-certificate-errors: TLS certificate host chains and name will not be verified")
