@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"html/template"
 	"io"
 	"os"
@@ -497,20 +498,26 @@ func (ip *InstallationProcess) Execute() (string, error) {
 		}
 	}(r.ID)
 
+	// Wait for the container to stop
 	sChan, eChan := ip.client.ContainerWait(ctx, r.ID, container.WaitConditionNotRunning)
 	select {
 	case err := <-eChan:
-		// Once the container has stopped running we can mark the install process as being completed.
-		if err == nil {
-			ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
-		} else {
+		if err != nil {
 			return "", err
 		}
-	case <-sChan:
+	case status := <-sChan:
+		// Check container exit code
+		if status.StatusCode != 0 {
+			ip.Server.Events().Publish(DaemonMessageEvent, "Installation process failed.")
+			return "", fmt.Errorf("installation process failed with exit code %d", status.StatusCode)
+		}
+		// Success
+		ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
 	}
 
 	return r.ID, nil
 }
+
 
 // StreamOutput streams the output of the installation process to a log file in
 // the server configuration directory, as well as to a websocket listener so
