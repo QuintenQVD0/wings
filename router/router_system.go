@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/apex/log"
@@ -14,6 +15,7 @@ import (
 	"github.com/pelican-dev/wings/server"
 	"github.com/pelican-dev/wings/server/installer"
 	"github.com/pelican-dev/wings/system"
+	"github.com/pelican-dev/wings/diagnostics"
 )
 
 // Returns information about the system that wings is running on.
@@ -164,6 +166,40 @@ func postCreateServer(c *gin.Context) {
 type postUpdateConfigurationResponse struct {
 	Applied bool `json:"applied"`
 }
+
+type DiagnosticsArgs struct {
+	IncludeEndpoints   bool
+	IncludeLogs        bool
+	ReviewBeforeUpload bool
+	HastebinURL        string
+	LogLines           int
+}
+
+// Return the wings diagnostics output to the panel if requested.
+func getWingsDiagnostics(c *gin.Context) {
+	includeEndpoints := c.DefaultQuery("IncludeEndpoints", "false") == "true"
+	includeLogs := c.DefaultQuery("IncludeLogs", "true") == "true"
+	reviewBeforeUpload := c.DefaultQuery("ReviewBeforeUpload", "true") == "false"
+	hastebinURL := c.DefaultQuery("HastebinURL", "https://paste.pelistuff.com")
+	logLinesStr := c.DefaultQuery("LogLines", strconv.Itoa(200))
+	logLines, err := strconv.Atoi(logLinesStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid LogLines parameter"})
+		return
+	}
+
+	args := DiagnosticsArgs{
+		IncludeEndpoints:   includeEndpoints,
+		IncludeLogs:        includeLogs,
+		ReviewBeforeUpload: reviewBeforeUpload,
+		HastebinURL:        hastebinURL,
+		LogLines:           logLines,
+	}
+
+	repreport, _ := GenerateDiagnosticsReport(args)
+	c.String(http.StatusOK, repreport)
+}
+
 
 // Updates the running configuration for this Wings instance.
 func postUpdateConfiguration(c *gin.Context) {
