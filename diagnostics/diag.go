@@ -23,8 +23,6 @@ import (
 type DiagnosticsArgs struct {
 	IncludeEndpoints   bool
 	IncludeLogs        bool
-	ReviewBeforeUpload bool
-	HastebinURL        string
 	LogLines           int
 }
 

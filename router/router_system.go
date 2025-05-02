@@ -169,8 +169,6 @@ type postUpdateConfigurationResponse struct {
 type DiagnosticsArgs struct {
 	IncludeEndpoints   bool
 	IncludeLogs        bool
-	ReviewBeforeUpload bool
-	HastebinURL        string
 	LogLines           int
 }
 
@@ -178,8 +176,6 @@ type DiagnosticsArgs struct {
 func getWingsDiagnostics(c *gin.Context) {
 	includeEndpoints := c.DefaultQuery("IncludeEndpoints", "false") == "true"
 	includeLogs := c.DefaultQuery("IncludeLogs", "true") == "true"
-	reviewBeforeUpload := c.DefaultQuery("ReviewBeforeUpload", "true") == "false"
-	hastebinURL := c.DefaultQuery("HastebinURL", "https://paste.pelistuff.com")
 	logLinesStr := c.DefaultQuery("LogLines", strconv.Itoa(200))
 	logLines, err := strconv.Atoi(logLinesStr)
 	if err != nil {
@@ -190,8 +186,6 @@ func getWingsDiagnostics(c *gin.Context) {
 	args := DiagnosticsArgs{
 		IncludeEndpoints:   includeEndpoints,
 		IncludeLogs:        includeLogs,
-		ReviewBeforeUpload: reviewBeforeUpload,
-		HastebinURL:        hastebinURL,
 		LogLines:           logLines,
 	}
 
