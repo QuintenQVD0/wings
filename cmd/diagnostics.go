@@ -15,7 +15,6 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/pelican-dev/wings/loggers/cli"
 	"github.com/spf13/cobra"
-	"github.com/pelican-dev/wings/diagnostics"
 )
 
 const (
@@ -103,6 +102,10 @@ func diagnosticsCmdRun(*cobra.Command, []string) {
 			fmt.Println("Your report is available here: ", u)
 		}
 	}
+}
+
+func GenerateDiagnosticsReport(diagnosticsArgs DiagnosticsArgs) (string, any) {
+	panic("unimplemented")
 }
 
 func uploadToHastebin(hbUrl, content string) (string, error) {

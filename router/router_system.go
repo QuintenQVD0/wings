@@ -15,7 +15,6 @@ import (
 	"github.com/pelican-dev/wings/server"
 	"github.com/pelican-dev/wings/server/installer"
 	"github.com/pelican-dev/wings/system"
-	"github.com/pelican-dev/wings/diagnostics"
 )
 
 // Returns information about the system that wings is running on.
@@ -198,6 +197,10 @@ func getWingsDiagnostics(c *gin.Context) {
 
 	repreport, _ := GenerateDiagnosticsReport(args)
 	c.String(http.StatusOK, repreport)
+}
+
+func GenerateDiagnosticsReport(args DiagnosticsArgs) (string, any) {
+	panic("unimplemented")
 }
 
 
