@@ -1,7 +1,10 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
+	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -151,6 +154,42 @@ func (s *Server) StartEventListeners() {
 	}()
 }
 
+func (s *Server) StartLogListerner(path string){
+	// Check if file exists
+	if _, err := s.fs.UnixFS().Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			s.Log().Debugf("log file %s does not exist, skipping streaming", path)
+			return
+		}
+		s.Log().WithError(err).Errorf("failed to stat log file %s", path)
+		return
+	}
+
+	// Open file for reading only
+	f, err := s.fs.UnixFS().OpenFile(path, ufs.O_RDONLY, 0)
+	if err != nil {
+		s.Log().WithError(err).Errorf("failed to open log file %s for streaming", path)
+		return
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				time.Sleep(100 * time.Millisecond) // wait for new data
+				continue
+			}
+			s.Log().WithError(err).Error("error reading log file")
+			return
+		}
+
+		// Publish each line to the WebSocket
+		s.Events().Publish(ConsoleOutputEvent, line)
+	}
+}
+
 var stripAnsiRegex = regexp.MustCompile("[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))")
 
 // Custom listener for console output events that will check if the given line
@@ -258,7 +297,7 @@ func (s *Server) onConsoleOutput(data []byte) {
 			s.Log().WithError(err).Error("failed to create log directory")
 			return
 		}
-		
+
 		// Open the file in append mode, create it if it doesn't exist
 		f, err := s.fs.UnixFS().OpenFile(writeConfig.Path, ufs.O_CREATE|ufs.O_APPEND|ufs.O_WRONLY, 0o644)
 		if err != nil {

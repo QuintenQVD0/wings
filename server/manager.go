@@ -227,6 +227,7 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 	if _, err := os.Stat(s.Filesystem().Path()); err == nil {
 		s.Filesystem().HasSpaceAvailable(true)
 	}
+	go s.StartLogListerner(s.procConfig.Logs.Read)
 
 	return s, nil
 }
