@@ -2,7 +2,7 @@ package server
 
 import (
 	"bytes"
-	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -12,6 +12,7 @@ import (
 	"github.com/apex/log"
 
 	"github.com/pelican-dev/wings/events"
+	"github.com/pelican-dev/wings/internal/ufs"
 	"github.com/pelican-dev/wings/system"
 
 	"github.com/pelican-dev/wings/environment"
@@ -249,9 +250,17 @@ func (s *Server) onConsoleOutput(data []byte) {
 	}
 
 	writeConfig := processConfiguration.Logs.Write
-	if writeConfig.Driver.Name == "file" && writeConfig.Path != "" {
+	if writeConfig.Driver.Name == "file" && writeConfig.Path != "" && !s.IsInstalling() {
+
+		// Ensure the directory exists
+		dir := filepath.Dir(writeConfig.Path)
+		if err := s.fs.CreateDirectory(dir, "/"); err != nil {
+			s.Log().WithError(err).Error("failed to create log directory")
+			return
+		}
+		
 		// Open the file in append mode, create it if it doesn't exist
-		f, err := s.fs.UnixFS().OpenFile(writeConfig.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		f, err := s.fs.UnixFS().OpenFile(writeConfig.Path, ufs.O_CREATE|ufs.O_APPEND|ufs.O_WRONLY, 0o644)
 		if err != nil {
 			s.Log().WithError(err).Error("failed to open log file for writing")
 			return
