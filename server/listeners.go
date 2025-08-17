@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -244,6 +245,30 @@ func (s *Server) onConsoleOutput(data []byte) {
 
 		if stop.Type == remote.ProcessStopCommand && bytes.Equal(v, []byte(stop.Value)) {
 			s.Environment.SetState(environment.ProcessOfflineState)
+		}
+	}
+
+	writeConfig := processConfiguration.Logs.Write
+	if writeConfig.Driver.Name == "file" && writeConfig.Path != "" {
+		// Open the file in append mode, create it if it doesn't exist
+		f, err := s.fs.UnixFS().OpenFile(writeConfig.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			s.Log().WithError(err).Error("failed to open log file for writing")
+			return
+		}
+		defer f.Close()
+
+		// Write the line to the file
+		if _, err := f.Write(v); err != nil {
+			s.Log().WithError(err).Error("failed to write console output to log file")
+			return
+		}
+
+		// add a newline if your v doesn't already end with one
+		if len(v) == 0 || v[len(v)-1] != '\n' {
+			if _, err := f.Write([]byte("\n")); err != nil {
+				s.Log().WithError(err).Error("failed to write newline to log file")
+			}
 		}
 	}
 }

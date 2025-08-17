@@ -138,6 +138,19 @@ type ProcessStopConfiguration struct {
 	Value string `json:"value"`
 }
 
+type LogsConfiguration struct {
+    Read  string `json:"read"`
+    Write struct {
+        Driver struct {
+            Name   string        `json:"name"`
+            Config []interface{} `json:"config"`
+        } `json:"driver"`
+        Path string `json:"path"`
+    } `json:"write"`
+}
+
+
+
 // ProcessConfiguration defines the process configuration for a given server
 // instance. This sets what Wings is looking for to mark a server as done
 // starting what to do when stopping, and what changes to make to the
@@ -149,6 +162,7 @@ type ProcessConfiguration struct {
 		StripAnsi       bool                 `json:"strip_ansi"`
 	} `json:"startup"`
 	Stop               ProcessStopConfiguration   `json:"stop"`
+	Logs               LogsConfiguration          `json:"logs"`
 	ConfigurationFiles []parser.ConfigurationFile `json:"configs"`
 }
 
