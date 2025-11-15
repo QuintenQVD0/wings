@@ -70,12 +70,13 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 		defer writer.Close()
 		defer mp.Close()
 
+		// Stream server data with its own checksum
 		src, pw := io.Pipe()
 		defer src.Close()
 		defer pw.Close()
 
-		h := sha256.New()
-		tee := io.TeeReader(src, h)
+		mainHasher := sha256.New()
+		mainTee := io.TeeReader(src, mainHasher)
 
 		dest, err := mp.CreateFormFile("archive", "archive.tar.gz")
 		if err != nil {
@@ -87,37 +88,46 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 		go func() {
 			defer close(ch)
 
-			if _, err := io.Copy(dest, tee); err != nil {
+			if _, err := io.Copy(dest, mainTee); err != nil {
 				ch <- fmt.Errorf("failed to stream archive to destination: %w", err)
 				return
 			}
 
-			t.Log().Debug("finished copying dest to tee")
+			t.Log().Debug("finished copying main archive to destination")
 		}()
 
+		// Stream server data
 		if err := a.Stream(ctx, pw); err != nil {
 			errChan <- errors.New("failed to stream archive to pipe")
 			return
 		}
 		t.Log().Debug("finished streaming archive to pipe")
 
-		// Close the pipe writer early to release resources and ensure that the data gets flushed.
+		// Close the pipe writer to ensure data gets flushed
 		_ = pw.Close()
 
-		// Wait for the copy to finish before we continue.
-		t.Log().Debug("waiting on copy to finish")
+		// Wait for the copy to finish
+		t.Log().Debug("waiting on main archive copy to finish")
 		if err := <-ch; err != nil {
 			errChan <- err
 			return
 		}
 
-		if err := mp.WriteField("checksum", hex.EncodeToString(h.Sum(nil))); err != nil {
-			errChan <- errors.New("failed to stream checksum")
+		// Write main archive checksum
+		if err := mp.WriteField("checksum_archive", hex.EncodeToString(mainHasher.Sum(nil))); err != nil {
+			errChan <- errors.New("failed to stream main archive checksum")
+			return
+		}
+
+		// Stream backups with individual checksums
+		t.SendMessage("Streaming backup files to destination...")
+		if err := a.StreamBackups(ctx, mp); err != nil {
+			errChan <- fmt.Errorf("failed to stream backups: %w", err)
 			return
 		}
 
 		cancel2()
-		t.SendMessage("Finished streaming archive to destination.")
+		t.SendMessage("Finished streaming archive and backups to destination.")
 
 		if err := mp.Close(); err != nil {
 			t.Log().WithError(err).Error("error while closing multipart writer")
