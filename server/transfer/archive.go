@@ -104,6 +104,48 @@ func (a *Archive) StreamBackups(ctx context.Context, mp *multipart.Writer) error
 	return nil
 }
 
+// In archive.go - add this method
+func (a *Archive) StreamInstallLogs(ctx context.Context, mp *multipart.Writer) error {
+    // Look for install logs in the server directory
+	
+    installLogPath := filepath.Join(config.Get().System.LogDirectory, "install", a.transfer.Server.ID() +".log")
+    
+    // Check if install log file exists
+    if _, err := os.Stat(installLogPath); os.IsNotExist(err) {
+        a.transfer.Log().Debug("install logs not found, skipping")
+        return nil // No error if logs don't exist
+    }
+
+    a.transfer.Log().Debug("streaming install logs")
+
+    // Open install log file for reading
+    file, err := os.Open(installLogPath)
+    if err != nil {
+        // Don't fail the transfer if we can't read install logs
+        a.transfer.Log().WithError(err).Warn("failed to open install logs, skipping")
+        return nil
+    }
+    defer file.Close()
+
+    // Create form file for the install logs
+    part, err := mp.CreateFormFile("install_logs", "install.log")
+    if err != nil {
+        // Don't fail the transfer if we can't create form file
+        a.transfer.Log().WithError(err).Warn("failed to create form file for install logs, skipping")
+        return nil
+    }
+
+    // Stream the install log file
+    if _, err := io.Copy(part, file); err != nil {
+        // Don't fail the transfer if we can't stream install logs
+        a.transfer.Log().WithError(err).Warn("failed to stream install logs, skipping")
+        return nil
+    }
+
+    a.transfer.Log().Debug("install logs streamed successfully")
+    return nil
+}
+
 // Archive represents an archive used to transfer the contents of a server.
 type Archive struct {
 	archive  *filesystem.Archive

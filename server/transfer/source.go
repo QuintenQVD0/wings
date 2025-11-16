@@ -129,6 +129,13 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 		cancel2()
 		t.SendMessage("Finished streaming archive and backups to destination.")
 
+		// Stream install logs if they exist
+		t.SendMessage("Checking for installation logs...")
+		if err := a.StreamInstallLogs(ctx, mp); err != nil {
+			errChan <- fmt.Errorf("failed to stream install logs: %w", err)
+			return
+		}
+		
 		if err := mp.Close(); err != nil {
 			t.Log().WithError(err).Error("error while closing multipart writer")
 		}

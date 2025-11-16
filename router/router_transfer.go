@@ -198,6 +198,44 @@ out:
 				// Store the RECEIVED checksum for verification
 				archiveChecksumReceived = string(checksumData)
 
+			case name == "install_logs":
+				trnsfr.Log().Debug("received install logs")
+				
+				// Create install log directory if it doesn't exist
+				cfg := config.Get()
+				installLogDir := filepath.Join(cfg.System.LogDirectory, "install")
+				if err := os.MkdirAll(installLogDir, 0755); err != nil {
+					// Don't fail transfer for install logs, just log and continue
+					trnsfr.Log().WithError(err).Warn("failed to create install log directory, skipping")
+					break
+				}
+				
+				// Use the correct install log path with server UUID
+				installLogPath := filepath.Join(installLogDir, trnsfr.Server.ID()+".log")
+				
+				// Create the install log file
+				installLogFile, err := os.Create(installLogPath)
+				if err != nil {
+					// Don't fail transfer for install logs, just log and continue
+					trnsfr.Log().WithError(err).Warn("failed to create install log file, skipping")
+					break
+				}
+				
+				// Stream the install logs to file
+				if _, err := io.Copy(installLogFile, p); err != nil {
+					installLogFile.Close()
+					// Don't fail transfer for install logs, just log and continue
+					trnsfr.Log().WithError(err).Warn("failed to stream install logs to file, skipping")
+					break
+				}
+				
+				if err := installLogFile.Close(); err != nil {
+					// Don't fail transfer for install logs, just log and continue
+					trnsfr.Log().WithError(err).Warn("failed to close install log file")
+				}
+				
+				trnsfr.Log().WithField("path", installLogPath).Debug("install logs saved successfully")
+				
 			case strings.HasPrefix(name, "backup_"):
 				backupName := strings.TrimPrefix(name, "backup_")
 				trnsfr.Log().WithField("backup", backupName).Debug("received backup file")
