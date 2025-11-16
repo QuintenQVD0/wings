@@ -10,8 +10,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"time"
-
-	"github.com/pelican-dev/wings/internal/progress"
 )
 
 // PushArchiveToTarget POSTs the archive to the target node and returns the
@@ -34,7 +32,7 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 	// Send the upload progress to the websocket every 5 seconds.
 	ctx2, cancel2 := context.WithCancel(ctx)
 	defer cancel2()
-	go func(ctx context.Context, p *progress.Progress, tc *time.Ticker) {
+	go func(ctx context.Context, a *Archive, tc *time.Ticker) {
 		defer tc.Stop()
 
 		for {
@@ -42,10 +40,17 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 			case <-ctx.Done():
 				return
 			case <-tc.C:
-				t.SendMessage("Uploading " + p.Progress(25))
+				progress := a.Progress()
+				if progress != nil {
+					message := "Uploading " + progress.Progress(25)
+					// We can't easily show backup count here without tracking totalBackups
+					// But we're already showing individual backup progress in StreamBackups
+					t.SendMessage(message)
+					t.Log().Info(message)
+				}
 			}
 		}
-	}(ctx2, a.Progress(), time.NewTicker(5*time.Second))
+	}(ctx2, a, time.NewTicker(5*time.Second))
 
 	// Create a new request using the pipe as the body.
 	body, writer := io.Pipe()
@@ -130,12 +135,11 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 		t.SendMessage("Finished streaming archive and backups to destination.")
 
 		// Stream install logs if they exist
-		t.SendMessage("Checking for installation logs...")
 		if err := a.StreamInstallLogs(ctx, mp); err != nil {
 			errChan <- fmt.Errorf("failed to stream install logs: %w", err)
 			return
 		}
-		
+
 		if err := mp.Close(); err != nil {
 			t.Log().WithError(err).Error("error while closing multipart writer")
 		}
