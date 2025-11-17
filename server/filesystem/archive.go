@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,16 +31,43 @@ var pool = sync.Pool{
 	},
 }
 
+// Progress wraps the progress tracker with a callback
+type Progress struct {
+	progress   *progress.Progress
+	OnProgress func(float64, int64, int64)
+}
+
+// NewProgress creates a new Progress wrapper
+func NewProgress(p *progress.Progress, onProgress func(float64, int64, int64)) *Progress {
+	return &Progress{
+		progress:   p,
+		OnProgress: onProgress,
+	}
+}
+
+// Write implements the io.Writer interface and calls the progress callback
+func (p *Progress) Write(b []byte) (int, error) {
+	n, err := p.progress.Write(b)
+	if n > 0 && p.OnProgress != nil && p.progress.Total() > 0 {
+		written := int64(p.progress.Written())
+		total := int64(p.progress.Total())
+		percentage := float64(written) / float64(total) * 100
+		p.OnProgress(math.Round(percentage*100)/100, written, total)
+	}
+	return n, err
+}
+
 // TarProgress .
 type TarProgress struct {
 	*tar.Writer
-	p *progress.Progress
+	p *Progress
 }
 
 // NewTarProgress .
-func NewTarProgress(w *tar.Writer, p *progress.Progress) *TarProgress {
+func NewTarProgress(w *tar.Writer, p *Progress) *TarProgress {
 	if p != nil {
-		p.Writer = w
+		// Set the writer on the underlying progress tracker
+		p.progress.Writer = w
 	}
 	return &TarProgress{
 		Writer: w,
@@ -72,7 +100,7 @@ type Archive struct {
 	Files []string
 
 	// Progress wraps the writer of the archive to pass through the progress tracker.
-	Progress *progress.Progress
+	Progress *Progress
 
 	w *TarProgress
 }
@@ -151,7 +179,8 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 
 	a.w = NewTarProgress(tw, a.Progress)
 
-	fs := a.Filesystem.unixFS
+	// Get the actual UnixFS instance
+	fs := a.Filesystem.UnixFS()
 
 	// If we're specifically looking for only certain files, or have requested
 	// that certain files be ignored we'll update the callback function to reflect
@@ -169,6 +198,19 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		callback = a.withFilesCallback()
 	} else {
 		callback = a.callback()
+	}
+
+	// Calculate total size for progress tracking if we have a progress callback
+	if a.Progress != nil && a.Progress.OnProgress != nil {
+		totalSize, err := a.calculateTotalSize(fs)
+		if err != nil {
+			log.WithError(err).Warn("failed to calculate total backup size")
+		} else {
+			// Set the total on the underlying progress tracker
+			a.Progress.progress.SetTotal(uint64(totalSize))
+			// Report initial progress
+			a.Progress.OnProgress(0, 0, totalSize)
+		}
 	}
 
 	// Open the base directory we were provided.
@@ -190,6 +232,60 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 			return callback(dirfd, name, relative, d)
 		}
 	})
+}
+
+// calculateTotalSize calculates the total size of files to be backed up
+// calculateTotalSize calculates the total size of files to be backed up
+func (a *Archive) calculateTotalSize(fs *ufs.UnixFS) (int64, error) {
+	var total int64
+	dirfd, name, closeFd, err := fs.SafePath(a.BaseDirectory)
+	defer closeFd()
+	if err != nil {
+		return 0, err
+	}
+
+	var walkFn walkFunc
+	if len(a.Files) == 0 && len(a.Ignore) > 0 {
+		i := ignore.CompileIgnoreLines(strings.Split(a.Ignore, "\n")...)
+		walkFn = func(_ int, _, relative string, d ufs.DirEntry) error {
+			if i.MatchesPath(relative) {
+				return SkipThis
+			}
+			if !d.IsDir() {
+				if info, err := d.Info(); err == nil {
+					total += info.Size()
+				}
+			}
+			return nil
+		}
+	} else {
+		walkFn = func(_ int, _, _ string, d ufs.DirEntry) error {
+			if !d.IsDir() {
+				if info, err := d.Info(); err == nil {
+					total += info.Size()
+				}
+			}
+			return nil
+		}
+	}
+
+	err = fs.WalkDirat(dirfd, name, func(dirfd int, name, relative string, d ufs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Call the walk function and handle SkipThis specially
+		if walkErr := walkFn(dirfd, name, relative, d); walkErr != nil {
+			if walkErr == SkipThis {
+				// SkipThis means we should skip this file but continue walking
+				return nil
+			}
+			return walkErr
+		}
+		return nil
+	})
+
+	return total, err
 }
 
 // Callback function used to determine if a given file should be included in the archive
@@ -324,8 +420,11 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		}()
 	}
 
+	// Get the actual UnixFS instance
+	fs := a.Filesystem.UnixFS()
+
 	// Open the file.
-	f, err := a.Filesystem.unixFS.OpenFileat(dirfd, name, ufs.O_RDONLY, 0)
+	f, err := fs.OpenFileat(dirfd, name, ufs.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -339,4 +438,24 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return errors.WrapIff(err, "failed to copy '%s' to archive", header.Name)
 	}
 	return nil
+}
+
+// NewBasicProgress creates a new Progress wrapper without callbacks for use in transfers.
+// This maintains compatibility with the existing transfer system while using the new
+// progress tracking architecture.
+func NewBasicProgress(total uint64) *Progress {
+	p := progress.NewProgress(total)
+	return &Progress{
+		progress: p,
+		// No OnProgress callback needed for transfers
+	}
+}
+
+// GetUnderlyingProgress returns the underlying progress.Progress instance for compatibility
+// with systems that still expect the original progress type (e.g., transfer system).
+func (p *Progress) GetUnderlyingProgress() *progress.Progress {
+	if p == nil {
+		return nil
+	}
+	return p.progress
 }

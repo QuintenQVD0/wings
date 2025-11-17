@@ -11,6 +11,7 @@ import (
 	"github.com/mholt/archives"
 
 	"github.com/pelican-dev/wings/config"
+	"github.com/pelican-dev/wings/internal/progress"
 	"github.com/pelican-dev/wings/remote"
 	"github.com/pelican-dev/wings/server/filesystem"
 )
@@ -75,10 +76,20 @@ func (b *LocalBackup) WithLogContext(c map[string]interface{}) {
 
 // Generate generates a backup of the selected files and pushes it to the
 // defined location for this instance.
+// In the Generate method of backup_local.go, update the progress creation:
+// In the Generate method of backup_local.go:
 func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
+	// Create archive with progress support
 	a := &filesystem.Archive{
 		Filesystem: fsys,
 		Ignore:     ignore,
+	}
+
+	// If we have a progress callback, set up progress tracking
+	if b.progressCb != nil {
+		// Create a new progress instance with initial total of 0 (will be set later)
+		progressTracker := progress.NewProgress(0)
+		a.Progress = filesystem.NewProgress(progressTracker, b.progressCb)
 	}
 
 	b.log().WithField("path", b.Path()).Info("creating backup for server")

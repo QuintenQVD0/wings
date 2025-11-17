@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"strings"
@@ -33,8 +34,16 @@ func postServerBackup(c *gin.Context) {
 	switch data.Adapter {
 	case backup.LocalBackupAdapter:
 		adapter = backup.NewLocal(client, data.Uuid, s.ID(), data.Ignore)
+		// Set up progress reporting for local backups only
+		adapter.SetProgressCallback(func(percentage float64, written, total int64) {
+			// Report progress to the panel via API client
+			if err := client.SendBackupProgress(context.Background(), s.ID(), data.Uuid, percentage, written, total); err != nil {
+				logger.WithError(err).Warn("failed to send backup progress to panel")
+			}
+		})
 	case backup.S3BackupAdapter:
 		adapter = backup.NewS3(client, data.Uuid, s.ID(), data.Ignore)
+		// S3 backups don't get progress tracking
 	default:
 		middleware.CaptureAndAbort(c, errors.New("router/backups: provided adapter is not valid: "+string(data.Adapter)))
 		return

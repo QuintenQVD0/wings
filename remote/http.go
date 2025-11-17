@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pelican-dev/wings/internal/models"
@@ -34,8 +36,8 @@ type Client interface {
 	ValidateSftpCredentials(ctx context.Context, request SftpAuthRequest) (SftpAuthResponse, error)
 	SendActivityLogs(ctx context.Context, activity []models.Activity) error
 	PushServerStateChange(ctx context.Context, sid string, stateChange ServerStateChange) error
+	SendBackupProgress(ctx context.Context, serverID, backupUUID string, percentage float64, written, total int64) error
 }
-
 type client struct {
 	httpClient  *http.Client
 	baseUrl     string
@@ -304,3 +306,92 @@ func debugLogRequest(req *http.Request) {
 		"headers":  headers,
 	}).Debug("making request to external HTTP endpoint")
 }
+
+// SendBackupProgress sends backup progress updates to the panel with throttling
+func (c *client) SendBackupProgress(ctx context.Context, serverID, backupUUID string, percentage float64, written, total int64) error {
+	// Throttle progress updates:
+	// - Only send at specific percentage intervals (every 20%)
+	// - Send 0% only once at the beginning
+	// - Send 100% only once at the end
+	// - Or if at least 5 second has passed since the last update
+
+	type progressState struct {
+		lastPercentage float64
+		lastSent       time.Time
+		sentZero       bool
+		sentHundred    bool
+	}
+
+	var state *progressState
+	if cached, ok := progressCache.Load(backupUUID); ok {
+		state = cached.(*progressState)
+	} else {
+		state = &progressState{}
+		progressCache.Store(backupUUID, state)
+	}
+
+	now := time.Now()
+
+	// Check if we should send this update
+	shouldSend := false
+
+	// Send 0% only once at the beginning
+	if percentage == 0 && !state.sentZero {
+		shouldSend = true
+		state.sentZero = true
+	} else if percentage >= 100 && !state.sentHundred { // Send 100% only once at the end
+		shouldSend = true
+		state.sentHundred = true
+	} else if percentage > 0 && percentage < 100 && math.Abs(percentage-state.lastPercentage) >= 20.0 { // Send if percentage changed by at least 20% (and we're between 0% and 100%)
+		shouldSend = true
+	} else if percentage > 0 && percentage < 100 && now.Sub(state.lastSent) >= 5*time.Second { // Send if at least 5 second has passed since last update (and we're between 0% and 100%)
+		shouldSend = true
+	}
+
+	if !shouldSend {
+		return nil
+	}
+
+	// Update cache
+	state.lastPercentage = percentage
+	state.lastSent = now
+
+	payload := map[string]interface{}{
+		"uuid":       backupUUID,
+		"server_id":  serverID,
+		"percentage": percentage,
+		"written":    written,
+		"total":      total,
+		"timestamp":  now.Unix(),
+	}
+
+	// Log the payload for debugging
+	log.WithFields(log.Fields{
+		"backup_uuid": backupUUID,
+		"server_id":   serverID,
+		"percentage":  percentage,
+		"written":     written,
+		"total":       total,
+	}).Debug("sending backup progress update")
+
+	// Use a shorter timeout for progress updates since they're less critical
+	progressCtx, cancel := context.WithTimeout(ctx, time.Second*5)
+	defer cancel()
+
+	// Use the backup-scoped endpoint instead of server-scoped
+	res, err := c.Post(progressCtx, "/backups/"+backupUUID+"/progress", payload)
+	if err != nil {
+		// Don't return errors for progress updates - they're best effort
+		log.WithField("error", err).Debug("failed to send backup progress update")
+		return nil
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusNoContent {
+		log.WithField("status", res.StatusCode).Debug("panel returned non-OK status for backup progress update")
+	}
+
+	return nil
+}
+
+var progressCache = &sync.Map{}

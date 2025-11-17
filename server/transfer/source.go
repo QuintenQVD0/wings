@@ -45,7 +45,7 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 				t.SendMessage("Uploading " + p.Progress(25))
 			}
 		}
-	}(ctx2, a.Progress(), time.NewTicker(5*time.Second))
+	}(ctx2, a.GetUnderlyingProgress(), time.NewTicker(5*time.Second))
 
 	// Create a new request using the pipe as the body.
 	body, writer := io.Pipe()

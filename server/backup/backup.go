@@ -36,6 +36,9 @@ const (
 // and remote backups allowing the files to be restored.
 type RestoreCallback func(file string, info fs.FileInfo, r io.ReadCloser) error
 
+// ProgressCallback is called during backup generation to report progress
+type ProgressCallback func(percentage float64, written, total int64)
+
 // noinspection GoNameStartsWithPackageName
 type BackupInterface interface {
 	// SetClient sets the API request client on the backup interface.
@@ -69,6 +72,8 @@ type BackupInterface interface {
 	// the given source. Not every backup implementation will support this nor
 	// will every implementation require a reader be provided.
 	Restore(context.Context, io.Reader, RestoreCallback) error
+	// SetProgressCallback sets a callback function to report backup progress (optional)
+	SetProgressCallback(ProgressCallback)
 }
 
 type Backup struct {
@@ -83,9 +88,10 @@ type Backup struct {
 	// compatible with a standard .gitignore structure.
 	Ignore string `json:"ignore"`
 
-	client     remote.Client
-	adapter    AdapterType
-	logContext map[string]interface{}
+	client      remote.Client
+	adapter     AdapterType
+	logContext  map[string]interface{}
+	progressCb  ProgressCallback
 }
 
 func (b *Backup) SetClient(c remote.Client) {
@@ -163,6 +169,11 @@ func (b *Backup) Details(ctx context.Context, parts []remote.BackupPart) (*Archi
 
 func (b *Backup) Ignored() string {
 	return b.Ignore
+}
+
+// SetProgressCallback sets the progress callback function
+func (b *Backup) SetProgressCallback(cb ProgressCallback) {
+	b.progressCb = cb
 }
 
 // Returns a logger instance for this backup with the additional context fields

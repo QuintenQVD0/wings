@@ -36,7 +36,7 @@ func NewArchive(t *Transfer, size uint64) *Archive {
 	return &Archive{
 		archive: &filesystem.Archive{
 			Filesystem: t.Server.Filesystem(),
-			Progress:   progress.NewProgress(size),
+			Progress:   filesystem.NewBasicProgress(size),
 		},
 	}
 }
@@ -46,7 +46,15 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 	return a.archive.Stream(ctx, w)
 }
 
-// Progress returns the current progress of the archive.
-func (a *Archive) Progress() *progress.Progress {
+// Progress returns the current progress tracker for the archive.
+func (a *Archive) Progress() *filesystem.Progress {
 	return a.archive.Progress
+}
+
+// GetUnderlyingProgress returns the underlying progress.Progress instance for compatibility
+func (a *Archive) GetUnderlyingProgress() *progress.Progress {
+	if a.archive.Progress == nil {
+		return nil
+	}
+	return a.archive.Progress.GetUnderlyingProgress()
 }
