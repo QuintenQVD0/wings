@@ -235,7 +235,6 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 }
 
 // calculateTotalSize calculates the total size of files to be backed up
-// calculateTotalSize calculates the total size of files to be backed up
 func (a *Archive) calculateTotalSize(fs *ufs.UnixFS) (int64, error) {
 	var total int64
 	dirfd, name, closeFd, err := fs.SafePath(a.BaseDirectory)

@@ -76,8 +76,6 @@ func (b *LocalBackup) WithLogContext(c map[string]interface{}) {
 
 // Generate generates a backup of the selected files and pushes it to the
 // defined location for this instance.
-// In the Generate method of backup_local.go, update the progress creation:
-// In the Generate method of backup_local.go:
 func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
 	// Create archive with progress support
 	a := &filesystem.Archive{
