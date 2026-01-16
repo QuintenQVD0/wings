@@ -70,6 +70,8 @@ type SftpConfiguration struct {
 	Port int `default:"2022" json:"bind_port" yaml:"bind_port"`
 	// If set to true, no write actions will be allowed on the SFTP server.
 	ReadOnly bool `default:"false" yaml:"read_only"`
+	// If set to true users won't be able to login using their password.
+	KeyOnly bool `default:"false" yaml:"key_only"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is
@@ -92,6 +94,12 @@ type ApiConfiguration struct {
 	// is enabled on this instance. If set to "true" remote downloads will not be possible for
 	// servers.
 	DisableRemoteDownload bool `json:"-" yaml:"disable_remote_download"`
+
+	// RemoteDownload contains configuration for server remote download functionality.
+	RemoteDownload struct {
+		// MaxRedirects controls how many HTTP redirects are followed when performing a remote download.
+		MaxRedirects int `default:"10" json:"max_redirects" yaml:"max_redirects"`
+	} `json:"remote_download" yaml:"remote_download"`
 
 	// The maximum size for files uploaded through the Panel in MiB.
 	UploadLimit int64 `default:"100" json:"upload_limit" yaml:"upload_limit"`
@@ -120,6 +128,12 @@ type RemoteQueryConfiguration struct {
 	// 50 servers is likely just as quick as two for 100 or one for 400, and will certainly
 	// be less likely to cause performance issues on the Panel.
 	BootServersPerPage int `default:"50" yaml:"boot_servers_per_page"`
+
+	//When using services like Cloudflare Access to manage access to 
+	//a specific system via an external authentication system, 
+	//it is possible to add special headers to bypass authentication. 
+	//The mentioned headers can be appended to queries sent from Wings to the panel.
+	CustomHeaders map[string]string `yaml:"custom_headers"`
 }
 
 // SystemConfiguration defines basic system configuration settings.
