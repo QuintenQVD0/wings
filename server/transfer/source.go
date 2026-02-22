@@ -180,8 +180,17 @@ func (t *Transfer) PushArchiveToTarget(url, token string, backups []string) ([]b
 	client := http.Client{Timeout: 0}
 	res, err := client.Do(req)
 
-	// Always wait for the streaming goroutine to finish before inspecting results.
-	// This also ensures the goroutine is cleaned up even on HTTP errors.
+	// client.Do has returned — the HTTP transport will no longer read from body.
+	// We must unblock the streaming goroutine which may be stuck writing into the
+	// pipe (e.g. in a.Stream, io.Copy, or mp.WriteField):
+	//   1. Cancel the context so context-aware operations (a.Stream, a.StreamBackups)
+	//      return immediately.
+	//   2. Close the pipe read end so any non-context-aware writes get a broken pipe
+	//      error and return instead of blocking forever.
+	cancel()
+	body.Close()
+
+	// Now it is safe to wait — the goroutine will unblock and exit promptly.
 	t.Log().Debug("waiting for streaming goroutine to complete")
 	streamErr := <-errChan
 	t.Log().Debug("streaming goroutine completed")
