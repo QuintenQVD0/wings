@@ -54,139 +54,164 @@ func (t *Transfer) PushArchiveToTarget(url, token string, backups []string) ([]b
 
 	// Create a new request using the pipe as the body.
 	body, writer := io.Pipe()
-	defer body.Close()
-	defer writer.Close()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
+		body.Close()
+		writer.Close()
 		return nil, err
 	}
 	req.Header.Set("Authorization", token)
 
 	// Create a new multipart writer that writes the archive to the pipe.
+	// NOTE: Do NOT defer mp.Close() here. The goroutine below owns the lifecycle
+	// of mp and writer. Closing them from outside would corrupt the stream.
 	mp := multipart.NewWriter(writer)
-	defer mp.Close()
 	req.Header.Set("Content-Type", mp.FormDataContentType())
 
-	// Create a new goroutine to write the archive to the pipe used by the
-	// multipart writer.
-	errChan := make(chan error)
+	// errChan receives the result of the streaming goroutine.
+	errChan := make(chan error, 1)
 	go func() {
-		defer close(errChan)
-		defer writer.Close()
-		defer mp.Close()
+		// This goroutine exclusively owns mp and writer.
+		// It must close both exactly once, in the right order:
+		//   1. mp.Close() — writes the multipart terminating boundary into writer
+		//   2. writer.Close() — signals EOF to the HTTP request body reader
+		var streamErr error
+		defer func() {
+			// Step 1: finalize the multipart stream
+			if err := mp.Close(); err != nil && streamErr == nil {
+				streamErr = fmt.Errorf("failed to close multipart writer: %w", err)
+			}
+			t.Log().Debug("closed multipart writer")
 
-		// Stream server data with its own checksum
+			// Step 2: signal EOF to the HTTP body — must happen after mp.Close()
+			writer.Close()
+
+			// Step 3: report any error (or nil for success)
+			errChan <- streamErr
+			close(errChan)
+		}()
+
+		// --- Stream the main archive ---
+
 		src, pw := io.Pipe()
-		defer src.Close()
-		defer pw.Close()
 
 		mainHasher := sha256.New()
 		mainTee := io.TeeReader(src, mainHasher)
 
 		dest, err := mp.CreateFormFile("archive", "archive.tar.gz")
 		if err != nil {
-			errChan <- errors.New("failed to create form file")
+			src.Close()
+			pw.Close()
+			streamErr = errors.New("failed to create archive form file")
 			return
 		}
 
-		ch := make(chan error)
+		// Goroutine to copy from the tee (hasher side) into the multipart field.
+		ch := make(chan error, 1)
 		go func() {
-			defer close(ch)
-
-			if _, err := io.Copy(dest, mainTee); err != nil {
-				ch <- fmt.Errorf("failed to stream archive to destination: %w", err)
-				return
+			_, copyErr := io.Copy(dest, mainTee)
+			if copyErr != nil {
+				ch <- fmt.Errorf("failed to copy archive to destination: %w", copyErr)
+			} else {
+				t.Log().Debug("finished copying main archive to destination")
+				ch <- nil
 			}
-
-			t.Log().Debug("finished copying main archive to destination")
+			close(ch)
 		}()
 
-		// Stream server data
+		// Stream the actual server data into pw; the tee goroutine above reads from src.
 		if err := a.Stream(ctx, pw); err != nil {
-			errChan <- errors.New("failed to stream archive to pipe")
+			pw.Close()
+			src.Close()
+			// Drain ch so its goroutine doesn't leak.
+			<-ch
+			streamErr = fmt.Errorf("failed to stream archive to pipe: %w", err)
 			return
 		}
 		t.Log().Debug("finished streaming archive to pipe")
 
-		// Close the pipe writer to ensure data gets flushed
-		_ = pw.Close()
+		// Signal EOF to the tee reader by closing the write end.
+		pw.Close()
 
-		// Wait for the copy to finish
-		t.Log().Debug("waiting on main archive copy to finish")
+		// Wait for the copy goroutine to finish.
+		t.Log().Debug("waiting for main archive copy to finish")
 		if err := <-ch; err != nil {
-			errChan <- err
+			src.Close()
+			streamErr = err
 			return
 		}
+		src.Close()
 
-		// Write main archive checksum
+		// --- Write the archive checksum field ---
 		if err := mp.WriteField("checksum_archive", hex.EncodeToString(mainHasher.Sum(nil))); err != nil {
-			errChan <- errors.New("failed to stream main archive checksum")
+			streamErr = fmt.Errorf("failed to write archive checksum field: %w", err)
 			return
 		}
-		// Store the UUID of the backups we want to transfer in the transfer struct
+		t.Log().Debug("wrote archive checksum field")
+
+		// --- Stream backups ---
 		t.BackupUUIDs = backups
 		if len(t.BackupUUIDs) > 0 {
 			t.SendMessage(fmt.Sprintf("Streaming %d backup files to destination...", len(t.BackupUUIDs)))
 			if err := a.StreamBackups(ctx, mp); err != nil {
-				errChan <- fmt.Errorf("failed to stream backups: %w", err)
+				streamErr = fmt.Errorf("failed to stream backups: %w", err)
 				return
 			}
 		} else {
 			t.Log().Debug("no backups specified for transfer")
 		}
 
+		// Stop the progress ticker — we're done with the main upload phase.
 		cancel2()
 		t.SendMessage("Finished streaming archive and backups to destination.")
 
-		// Stream install logs if they exist
+		// --- Stream install logs (optional) ---
 		if err := a.StreamInstallLogs(ctx, mp); err != nil {
-			errChan <- fmt.Errorf("failed to stream install logs: %w", err)
+			streamErr = fmt.Errorf("failed to stream install logs: %w", err)
 			return
 		}
-		t.SendMessage("Finished streaming the install logs to destination.")
+		t.SendMessage("Finished streaming install logs to destination.")
 
-		if err := mp.Close(); err != nil {
-			t.Log().WithError(err).Error("error while closing multipart writer")
-		}
-		t.Log().Debug("closed multipart writer")
+		// streamErr is nil here; the deferred close will finalize and signal success.
+		t.Log().Debug("all parts written, finalizing multipart stream")
 	}()
 
 	t.Log().Debug("sending archive to destination")
 	client := http.Client{Timeout: 0}
 	res, err := client.Do(req)
+
+	// Always wait for the streaming goroutine to finish before inspecting results.
+	// This also ensures the goroutine is cleaned up even on HTTP errors.
+	t.Log().Debug("waiting for streaming goroutine to complete")
+	streamErr := <-errChan
+	t.Log().Debug("streaming goroutine completed")
+
 	if err != nil {
-		t.Log().Debug("error while sending archive to destination")
-		return nil, err
+		t.Log().WithError(err).Debug("HTTP error while sending archive to destination")
+		return nil, fmt.Errorf("failed to send archive to destination: %w", err)
 	}
+
+	if streamErr != nil {
+		if streamErr == context.Canceled {
+			return nil, streamErr
+		}
+		t.Log().WithError(streamErr).Debug("streaming error while sending archive to destination")
+		return nil, fmt.Errorf("streaming error: %w", streamErr)
+	}
+
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code from destination: %d", res.StatusCode)
-	}
-	t.Log().Debug("waiting for stream to complete")
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case err2 := <-errChan:
-		t.Log().Debug("stream completed")
-		if err != nil || err2 != nil {
-			if err == context.Canceled {
-				return nil, err
-			}
-
-			t.Log().WithError(err).Debug("failed to send archive to destination")
-			return nil, fmt.Errorf("http error: %w, multipart error: %v", err, err2)
-		}
 		defer res.Body.Close()
-		t.Log().Debug("received response from destination")
-
-		v, err := io.ReadAll(res.Body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response body: %w", err)
-		}
-
-		if res.StatusCode != http.StatusOK {
-			return nil, errors.New(string(v))
-		}
-
-		return v, nil
+		v, _ := io.ReadAll(res.Body)
+		return nil, fmt.Errorf("unexpected status code from destination: %d — %s", res.StatusCode, string(v))
 	}
+
+	defer res.Body.Close()
+	t.Log().Debug("received successful response from destination")
+
+	v, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return v, nil
 }
