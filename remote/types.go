@@ -173,6 +173,15 @@ type BackupRequest struct {
 type InstallStatusRequest struct {
 	Successful bool `json:"successful"`
 	Reinstall  bool `json:"reinstall"`
+
+	// ExitCode is the exit code returned by the installation script container.
+	// A nil value means the process never reached the script execution stage
+	// (e.g. failed to pull the image or create the container).
+	ExitCode     *int64  `json:"exit_code,omitempty"`
+ 
+	// ErrorMessage contains a description of the error when
+	// Successful is false. Nil when the install succeeded.
+	ErrorMessage *string `json:"error_message,omitempty"`
 }
 
 type ServerStateChange struct {

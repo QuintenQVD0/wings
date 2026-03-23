@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"html/template"
 	"io"
 	"os"
@@ -39,6 +40,8 @@ func (s *Server) Install() error {
 
 func (s *Server) install(reinstall bool) error {
 	var err error
+	var exitCode int64 = 0
+
 	if !s.Config().SkipEggScripts {
 		// Send the start event so the Panel can automatically update. We don't
 		// send this unless the process is actually going to run, otherwise all
@@ -46,21 +49,26 @@ func (s *Server) install(reinstall bool) error {
 		// install process being executed.
 		s.Events().Publish(InstallStartedEvent, "")
 
-		err = s.internalInstall()
+		exitCode, err = s.internalInstall()
 	} else {
 		s.Log().Info("server configured to skip running installation scripts for this egg, not executing process")
 	}
 
-	s.Log().WithField("was_successful", err == nil).Debug("notifying panel of server install state")
-	if serr := s.SyncInstallState(err == nil, reinstall); serr != nil {
-		l := s.Log().WithField("was_successful", err == nil)
+	successful := err == nil && exitCode == 0
+
+	s.Log().WithField("was_successful", successful).
+		WithField("exit_code", exitCode).
+		Debug("notifying panel of server install state")
+
+	if serr := s.SyncInstallState(successful, reinstall, exitCode, err); serr != nil {
+		l := s.Log().WithField("was_successful", successful)
 
 		// If the request was successful but there was an error with this request,
 		// attach the error to this log entry. Otherwise, ignore it in this log
 		// since whatever is calling this function should handle the error and
 		// will end up logging the same one.
 		if err == nil {
-			l.WithField("error", err)
+			l.WithField("error", serr)
 		}
 
 		l.Warn("failed to notify panel of server install state")
@@ -73,6 +81,11 @@ func (s *Server) install(reinstall bool) error {
 	// Push an event to the websocket, so we can auto-refresh the information in
 	// the panel once the installation is completed.
 	s.Events().Publish(InstallCompletedEvent, "")
+
+	// Surface a non-zero exit code as an error so callers are aware.
+	if err == nil && exitCode != 0 {
+		return errors.Errorf("install: script exited with non-zero exit code: %d", exitCode)
+	}
 
 	return errors.WithStackIf(err)
 }
@@ -97,23 +110,30 @@ func (s *Server) Reinstall() error {
 }
 
 // Internal installation function used to simplify reporting back to the Panel.
-func (s *Server) internalInstall() error {
+// Returns the script's exit code alongside any Go-level error.
+func (s *Server) internalInstall() (int64, error) {
 	script, err := s.client.GetInstallationScript(s.Context(), s.ID())
 	if err != nil {
-		return err
+		return 0, err
 	}
 	p, err := NewInstallationProcess(s, &script)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	s.Log().Info("beginning installation process for server")
-	if err := p.Run(); err != nil {
-		return err
+	exitCode, err := p.Run()
+	if err != nil {
+		return exitCode, err
 	}
 
-	s.Log().Info("completed installation process for server")
-	return nil
+	if exitCode != 0 {
+		s.Log().WithField("exit_code", exitCode).Warn("installation script exited with non-zero exit code")
+	} else {
+		s.Log().Info("completed installation process for server")
+	}
+
+	return exitCode, nil
 }
 
 type InstallationProcess struct {
@@ -178,10 +198,11 @@ func (ip *InstallationProcess) RemoveContainer() error {
 // This will configure the required environment, and then spin up the
 // installation container. Once the container finishes installing the results
 // are stored in an installation log in the server's configuration directory.
-func (ip *InstallationProcess) Run() error {
+// Returns the script's exit code and any Go-level error.
+func (ip *InstallationProcess) Run() (int64, error) {
 	ip.Server.Log().Debug("acquiring installation process lock")
 	if !ip.Server.installing.SwapIf(true) {
-		return errors.New("install: cannot obtain installation lock")
+		return 0, errors.New("install: cannot obtain installation lock")
 	}
 
 	// We now have an exclusive lock on this installation process. Ensure that whenever this
@@ -193,13 +214,13 @@ func (ip *InstallationProcess) Run() error {
 	}()
 
 	if err := ip.BeforeExecute(); err != nil {
-		return err
+		return 0, err
 	}
 
-	cID, err := ip.Execute()
+	cID, exitCode, err := ip.Execute()
 	if err != nil {
 		_ = ip.RemoveContainer()
-		return err
+		return exitCode, err
 	}
 
 	// If this step fails, log a warning but don't exit out of the process. This is completely
@@ -208,7 +229,7 @@ func (ip *InstallationProcess) Run() error {
 		ip.Server.Log().WithField("error", err).Warn("failed to complete after-execute step of installation process")
 	}
 
-	return nil
+	return exitCode, nil
 }
 
 // Returns the location of the temporary data for the installation process.
@@ -407,8 +428,10 @@ func (ip *InstallationProcess) AfterExecute(containerId string) error {
 }
 
 // Execute executes the installation process inside a specially created docker
-// container.
-func (ip *InstallationProcess) Execute() (string, error) {
+// container. Returns the container ID, the script's exit code, and any
+// Go-level error. A non-zero exit code is NOT treated as a Go error here —
+// callers are responsible for deciding how to surface it.
+func (ip *InstallationProcess) Execute() (string, int64, error) {
 	// Create a child context that is canceled once this function is done running. This
 	// will also be canceled if the parent context (from the Server struct) is canceled
 	// which occurs if the server is deleted.
@@ -463,7 +486,7 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	// not exist when this runs if Wings boots with a missing directory and a user
 	// triggers a reinstall before trying to start the server.
 	if err := ip.Server.EnsureDataDirectoryExists(); err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	ip.Server.Log().WithField("install_script", ip.tempDir()+"/install.sh").Info("creating install container for server process")
@@ -496,12 +519,12 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	// Pass the networkings configuration or nil if none required
 	r, err := ip.client.ContainerCreate(ctx, conf, hostConf, netConf, nil, ip.Server.ID()+"_installer")
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	ip.Server.Log().WithField("container_id", r.ID).Info("running installation script for server in container")
 	if err := ip.client.ContainerStart(ctx, r.ID, container.StartOptions{}); err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	// Process the install event in the background by listening to the stream output until the
@@ -519,16 +542,34 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	sChan, eChan := ip.client.ContainerWait(ctx, r.ID, container.WaitConditionNotRunning)
 	select {
 	case err := <-eChan:
-		// Once the container has stopped running we can mark the install process as being completed.
-		if err == nil {
-			ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
-		} else {
-			return "", err
+		if err != nil {
+			return "", 0, err
 		}
-	case <-sChan:
-	}
+		// eChan fired without a status body — treat as success.
+		ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
+		return r.ID, 0, nil
 
-	return r.ID, nil
+	case body := <-sChan:
+		// body.StatusCode is the exit code of the entrypoint process inside the container.
+		exitCode := body.StatusCode
+		if body.Error != nil {
+			// Docker itself reported an error (e.g. OOM kill). Surface both.
+			return r.ID, exitCode, errors.Errorf(
+				"install: container reported error (exit code %d): %s",
+				exitCode, body.Error.Message,
+			)
+		}
+
+		if exitCode != 0 {
+			ip.Server.Events().Publish(DaemonMessageEvent,
+				fmt.Sprintf("Installation process exited with non-zero exit code: %d", exitCode),
+			)
+		} else {
+			ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
+		}
+
+		return r.ID, exitCode, nil
+	}
 }
 
 // StreamOutput streams the output of the installation process to a log file in
@@ -588,10 +629,19 @@ func (ip *InstallationProcess) resourceLimits() container.Resources {
 
 // SyncInstallState makes an HTTP request to the Panel instance notifying it that
 // the server has completed the installation process, and what the state of the
-// server is.
-func (s *Server) SyncInstallState(successful, reinstall bool) error {
-	return s.client.SetInstallationStatus(s.Context(), s.ID(), remote.InstallStatusRequest{
+// server is. The exit code of the install script and any error message are
+// included so the panel can surface them to administrators.
+func (s *Server) SyncInstallState(successful, reinstall bool, exitCode int64, installErr error) error {
+	req := remote.InstallStatusRequest{
 		Successful: successful,
 		Reinstall:  reinstall,
-	})
+		ExitCode:   &exitCode,
+	}
+
+	if installErr != nil {
+		msg := installErr.Error()
+		req.ErrorMessage = &msg
+	}
+
+	return s.client.SetInstallationStatus(s.Context(), s.ID(), req)
 }
