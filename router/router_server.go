@@ -273,7 +273,7 @@ func deleteServer(c *gin.Context) {
 	// done in a separate process since failure is not the end of the world and can be
 	// manually cleaned up after the fact.
 	//
-	// In addition, servers with large amounts of files can take some time to finish deleting,
+	// In addition, servers with large numbers of files can take some time to finish deleting,
 	// so we don't want to block the HTTP call while waiting on this.
 	//
 	// Only skip file removal when:
@@ -285,24 +285,23 @@ func deleteServer(c *gin.Context) {
 	pool := config.Get().System.Transfers.StoragePool
 	skipFileRemoval := pool.Enabled && pool.PoolName != "" && s.IsTransferring()
 	if !skipFileRemoval {
-	    go func(s *server.Server) {
-	    	fs := s.Filesystem()
-	    	p := fs.Path()
-	    	_ = fs.UnixFS().Close()
-	    	if err := os.RemoveAll(p); err != nil {
-	    		log.WithFields(log.Fields{"path": p, "error": err}).
-	    			Warn("failed to remove server files during deletion process")
-	    	}
+		go func(s *server.Server) {
+			fs := s.Filesystem()
+			p := fs.Path()
+			_ = fs.UnixFS().Close()
+			if err := os.RemoveAll(p); err != nil {
+				log.WithFields(log.Fields{"path": p, "error": err}).
+					Warn("failed to remove server files during deletion process")
+			}
 
-	    	if config.Get().System.Quotas.Enabled {
-	    		if err = quotas.DelQuota(s.Config().Uuid); err != nil {
-	    			log.WithFields(log.Fields{"server_id": s.Config().Pid, "error": err}).
-	    				Warn("failed to remove quota during deletion process")
-	    		}
-	    	}
-	    }(s)
+			if config.Get().System.Quotas.Enabled {
+				if err = quotas.DelQuota(s.Config().Uuid); err != nil {
+					log.WithFields(log.Fields{"server_id": s.Config().Pid, "error": err}).
+						Warn("failed to remove quota during deletion process")
+				}
+			}
+		}(s)
 	}
-
 
 	// remove hanging machine-id file for the server when removing
 	go func(s *server.Server) {

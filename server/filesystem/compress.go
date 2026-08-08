@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -14,26 +15,35 @@ import (
 	"emperror.dev/errors"
 	"github.com/klauspost/compress/zip"
 	"github.com/mholt/archives"
-
-	"github.com/pelican-dev/wings/internal/ufs"
-	"github.com/pelican-dev/wings/server/filesystem/archiverext"
 )
+
+type extractOptions struct {
+	dir    string
+	file   string
+	format archives.Format
+	r      io.Reader
+}
 
 // CompressFiles compresses all the files matching the given paths in the
 // specified directory. This function also supports passing nested paths to only
 // compress certain files and folders when working in a larger directory. This
 // effectively creates a local backup, but rather than ignoring specific files
-// and folders, it takes an allow-list of files and folders.
+// and folders, it takes an allowlist of files and folders.
 //
 // All paths are relative to the dir that is passed in as the first argument,
 // and the compressed file will be placed at that location named
 // `archive-{date}.tar.gz`.
-func (fs *Filesystem) CompressFiles(dir string, name string, paths []string, extension string) (ufs.FileInfo, string, error) {
+func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string, paths []string, extension string) (os.FileInfo, string, error) {
 	var validPaths []string
 	for _, file := range paths {
 		if err := fs.IsIgnored(path.Join(dir, file)); err == nil {
 			validPaths = append(validPaths, file)
 		}
+	}
+
+	ark, err := NewArchive(fs.root, dir, WithMatching(paths))
+	if err != nil {
+		return nil, errors.WrapIf(err, "server/filesystem: compress: failed to create archive instance")
 	}
 
 	// If there are no valid paths, return an error
@@ -69,7 +79,7 @@ func (fs *Filesystem) CompressFiles(dir string, name string, paths []string, ext
 	if name == "" {
 		name = fmt.Sprintf("archive-%s%s", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""), ext)
 	} else {
-		dirfd, _, closeFd, err := fs.unixFS.SafePath(path.Join(dir, name) + ext)
+		dirfd, _, closeFd, err := fs.root(path.Join(dir, name) + ext)
 		if err != nil {
 			if closeFd != nil {
 				closeFd()
