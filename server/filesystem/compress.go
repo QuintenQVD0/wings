@@ -15,6 +15,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/klauspost/compress/zip"
 	"github.com/mholt/archives"
+	"github.com/pelican-dev/wings/internal"
 )
 
 type extractOptions struct {
@@ -34,21 +35,12 @@ type extractOptions struct {
 // and the compressed file will be placed at that location named
 // `archive-{date}.tar.gz`.
 func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string, paths []string, extension string) (os.FileInfo, string, error) {
-	var validPaths []string
-	for _, file := range paths {
-		if err := fs.IsIgnored(path.Join(dir, file)); err == nil {
-			validPaths = append(validPaths, file)
-		}
-	}
-
-	ark, err := NewArchive(fs.root, dir, WithMatching(paths))
+	// Build the archive instance purely to reuse its validation + matcher
+	// construction (WithMatching handles the ignored/matching mutual-exclusion
+	// check and the leading-slash allowlist semantics). 
+	a, err := NewArchive(fs.root, dir, WithMatching(paths))
 	if err != nil {
-		return nil, errors.WrapIf(err, "server/filesystem: compress: failed to create archive instance")
-	}
-
-	// If there are no valid paths, return an error
-	if len(validPaths) == 0 {
-		return nil, "", fmt.Errorf("no valid files to compress")
+		return nil, "", errors.WrapIf(err, "server/filesystem: compress: failed to create archive instance")
 	}
 
 	// Normalize extension & assign MIME type
@@ -79,62 +71,69 @@ func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string
 	if name == "" {
 		name = fmt.Sprintf("archive-%s%s", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""), ext)
 	} else {
-		dirfd, _, closeFd, err := fs.root(path.Join(dir, name) + ext)
+		name, err = fs.findCopySuffix(dir, name, ext)
 		if err != nil {
-			if closeFd != nil {
-				closeFd()
-			}
-			return nil, "", err
-		}
-		if closeFd != nil {
-			defer closeFd()
-		}
-
-		name, err = fs.findCopySuffix(dirfd, name, ext)
-		if err != nil {
-			return nil, "", err
+			return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to find unique archive name")
 		}
 	}
 
-	destPath := path.Join(dir, name)
+	destPath := normalize(filepath.Join(dir, name))
 
+	//   1. fs.denylist (IsIgnored) - server-level denylist, always excluded
+	//   2. a.matching - the allowlist built from paths the user actually requested
+	// then against the sandboxed os.Root itself, mirroring Archive.addToArchive's
+	// approach (Lstat + filepath.Join(root.Name(), p)).
 	filesMap := make(map[string]string)
-	for _, file := range validPaths {
-		_, p, closeFd, err := fs.unixFS.SafePath(path.Join(dir, file))
-		if closeFd != nil {
-			defer closeFd()
-		}
-		if err != nil {
-			return nil, "", err
+	for _, file := range paths {
+		rel := path.Join(dir, file)
+
+		// Server-level denylist check - silently skip denylisted files
+		if err := fs.IsIgnored(rel); err != nil {
+			continue
 		}
 
-		// Construct the absolute path on disk for reading the file
-		absolutePath := filepath.Join(fs.Path(), dir, p)
-		// Only use the bare filename inside the archive
+		matchPath := "/" + strings.TrimPrefix(file, "/")
+		if a.matching != nil && !a.matching.MatchesPath(matchPath) {
+			continue
+		}
+
+		normalized := normalize(filepath.Join(dir, file))
+		// This check does what SafePath used to do.
+		// refuse any path that resolves outside the root directory
+		if _, err := fs.root.Lstat(normalized); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to stat file")
+		}
+
+		absolutePath := filepath.Join(fs.root.Name(), normalized)
 		filesMap[absolutePath] = file
 	}
 
-	ctx := context.Background()
+
+	if len(filesMap) == 0 {
+		return nil, "", fmt.Errorf("no valid files to compress")
+	}
 
 	files, err := archives.FilesFromDisk(ctx, nil, filesMap)
 	if err != nil {
-		return nil, "", err
+		return nil, "", errors.WrapIf(err, "server/filesystem: compress: failed to map files for archive")
 	}
 
-	f, err := fs.unixFS.OpenFile(destPath, ufs.O_WRONLY|ufs.O_CREATE, 0o644)
+	f, err := fs.root.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return nil, "", err
+		return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to open file for writing")
 	}
 	defer f.Close()
 
-	cw := ufs.NewCountedWriter(f)
+	cw := internal.NewCountedWriter(f)
 
-	// Call the correct archiver
 	switch extension {
 	case "zip":
 		zipper := archives.Zip{}
 		if err := zipper.Archive(ctx, cw, files); err != nil {
-			return nil, "", err
+			return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to write zip archive")
 		}
 	case "tar.bz2", "tbz2":
 		format := archives.CompressedArchive{
@@ -142,7 +141,7 @@ func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string
 			Archival:    archives.Tar{},
 		}
 		if err := format.Archive(ctx, cw, files); err != nil {
-			return nil, "", err
+			return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to write tar.bz2 archive")
 		}
 	case "tar.xz", "txz":
 		format := archives.CompressedArchive{
@@ -150,7 +149,7 @@ func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string
 			Archival:    archives.Tar{},
 		}
 		if err := format.Archive(ctx, cw, files); err != nil {
-			return nil, "", err
+			return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to write tar.xz archive")
 		}
 	default: // tar.gz and fallback
 		format := archives.CompressedArchive{
@@ -158,18 +157,21 @@ func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string
 			Archival:    archives.Tar{},
 		}
 		if err := format.Archive(ctx, cw, files); err != nil {
-			return nil, "", err
+			return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to write tar.gz archive")
 		}
 	}
 
-	if !fs.unixFS.CanFit(cw.BytesWritten()) {
-		_ = fs.unixFS.Remove(destPath)
-		return nil, "", newFilesystemError(ErrCodeDiskSpace, nil)
+	if err := fs.HasSpaceFor(cw.BytesWritten()); err != nil {
+		_ = fs.root.Remove(destPath)
+		return nil, "", newFilesystemError(ErrorCode(ErrNoSpaceAvailable), nil)
 	}
+	fs.addDisk(cw.BytesWritten())
 
-	fs.unixFS.Add(cw.BytesWritten())
 	info, err := f.Stat()
-	return info, mimetype, err
+	if err != nil {
+		return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to stat archive")
+	}
+	return info, mimetype, nil
 }
 
 func (fs *Filesystem) archiverFileSystem(ctx context.Context, p string) (iofs.FS, io.Closer, error) {
