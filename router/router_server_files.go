@@ -461,9 +461,15 @@ func postServerCompressFiles(c *gin.Context) {
 	// The extention comes from the panel
 	// Supported are: zip, tar.gz, tar.bz2, tar.xz
 	// No need to check if it is empty or wrong as if data.Extention is wrong the function falls back to tar.gz
-	f, err := s.Filesystem().CompressFiles(data.RootPath, data.Name, data.Files, data.Extension)
+	f, mimetype, err := s.Filesystem().CompressFiles(c.Request.Context(), data.RootPath, data.Name, data.Files, data.Extension)
 	if err != nil {
-		middleware.CaptureAndAbort(c, err)
+		if errors.Is(err, filesystem.ErrNoSpaceAvailable) {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "This server does not have enough available disk space to generate a compressed archive.",
+			})
+		} else {
+			middleware.CaptureAndAbort(c, err)
+		}
 		return
 	}
 
