@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"emperror.dev/errors"
 	"github.com/juju/ratelimit"
@@ -75,20 +76,24 @@ func (b *LocalBackup) WithLogContext(c map[string]interface{}) {
 
 // Generate generates a backup of the selected files and pushes it to the
 // defined location for this instance.
-func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
-	a := &filesystem.Archive{
-		Filesystem: fsys,
-		Ignore:     ignore,
+func (b *LocalBackup) Generate(ctx context.Context, basePath, ignore string) (*ArchiveDetails, error) {
+	r, err := os.OpenRoot(basePath)
+	if err != nil {
+		return nil, errors.Wrap(err, "server/backup: failed to open root directory")
+	}
+	defer r.Close()
+	a, err := filesystem.NewArchive(r, "/", filesystem.WithIgnored(strings.Split(ignore, "\n")))
+	if err != nil {
+		return nil, errors.WrapIf(err, "server/backup: failed to create archive")
 	}
 
 	b.log().WithField("path", b.Path()).Info("creating backup for server")
-	if _, err := os.Stat(filepath.Dir(b.Path())); os.IsNotExist(err) {
-		err := os.Mkdir(filepath.Dir(b.Path()), 0o700)
-		if err != nil {
-			return nil, err
-		}
+	f, err := os.OpenFile(b.Path(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, errors.Wrap(err, "server/backup: failed to open file for writing")
 	}
-	if err := a.Create(ctx, b.Path()); err != nil {
+	defer f.Close()
+	if err := a.Create(ctx, f); err != nil {
 		return nil, err
 	}
 	b.log().Info("created backup successfully")

@@ -285,10 +285,8 @@ func deleteServer(c *gin.Context) {
 	pool := config.Get().System.Transfers.StoragePool
 	skipFileRemoval := pool.Enabled && pool.PoolName != "" && s.IsTransferring()
 	if !skipFileRemoval {
-		go func(s *server.Server) {
-			fs := s.Filesystem()
-			p := fs.Path()
-			_ = fs.UnixFS().Close()
+		p := s.Filesystem().Path()
+		go func(p string) {
 			if err := os.RemoveAll(p); err != nil {
 				log.WithFields(log.Fields{"path": p, "error": err}).
 					Warn("failed to remove server files during deletion process")
@@ -300,7 +298,12 @@ func deleteServer(c *gin.Context) {
 						Warn("failed to remove quota during deletion process")
 				}
 			}
-		}(s)
+		}(p)
+	}
+
+
+	if err := s.Filesystem().Close(); err != nil {
+		log.WithFields(log.Fields{"server": s.ID(), "error": err}).Warn("failed to close filesystem root")
 	}
 
 	// remove hanging machine-id file for the server when removing
@@ -314,6 +317,9 @@ func deleteServer(c *gin.Context) {
 	middleware.ExtractManager(c).Remove(func(server *server.Server) bool {
 		return server.ID() == s.ID()
 	})
+
+	// Deallocate the reference to this server.
+	s = nil
 
 	c.Status(http.StatusNoContent)
 }

@@ -17,7 +17,7 @@ func (fs *Filesystem) Chmod(path string, mode os.FileMode) error {
 	if path == "" {
 		path = "."
 	}
-	if err := fs.root.Chmod(path, mode); err != nil {
+	if err := fs.Chmod(path, mode); err != nil {
 		return errors.Wrap(err, "server/filesystem: chmod: failed to chmod path")
 	}
 

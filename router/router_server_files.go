@@ -35,7 +35,7 @@ func getServerFileContents(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
-	f, st, err := s.Filesystem().File(p)
+	f, st, err := s.Filesystem().File(c.Query("file"))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
@@ -151,6 +151,7 @@ func putServerRenameFiles(c *gin.Context) {
 				}
 				if err := fs.Rename(pf, pt); err != nil {
 					// Return nil if the error is an is not exists.
+					// NOTE: os.IsNotExist() does not work if the error is wrapped.
 					if errors.Is(err, os.ErrNotExist) {
 						s.Log().WithField("error", err).
 							WithField("from_path", pf).
@@ -493,17 +494,6 @@ func postServerDecompressFiles(c *gin.Context) {
 
 	s := middleware.ExtractServer(c)
 	lg := middleware.ExtractLogger(c).WithFields(log.Fields{"root_path": data.RootPath, "file": data.File})
-	lg.Debug("checking if space is available for file decompression")
-	err := s.Filesystem().SpaceAvailableForDecompression(context.Background(), data.RootPath, data.File)
-	if err != nil {
-		if filesystem.IsErrorCode(err, filesystem.ErrCodeUnknownArchive) {
-			lg.WithField("error", err).Warn("failed to decompress file: unknown archive format")
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "The archive provided is in a format Wings does not understand."})
-			return
-		}
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
 
 	lg.Info("starting file decompression")
 	if err := s.Filesystem().DecompressFile(context.Background(), data.RootPath, data.File); err != nil {

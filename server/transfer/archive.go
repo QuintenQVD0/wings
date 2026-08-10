@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/internal/progress"
@@ -19,7 +20,7 @@ import (
 
 // Archive returns an archive that can be used to stream the contents of the
 // contents of a server.
-func (t *Transfer) Archive() (*Archive, error) {
+func (t *Transfer) Archive(r *os.Root) (*Archive, error) {
 	if t.archive == nil {
 		// Get the disk usage of the server (used to calculate the progress of the archive process)
 		rawSize, err := t.Server.Filesystem().DiskUsage(true)
@@ -27,8 +28,12 @@ func (t *Transfer) Archive() (*Archive, error) {
 			return nil, fmt.Errorf("transfer: failed to get server disk usage: %w", err)
 		}
 
-		// Create a new archive instance and assign it to the transfer.
-		t.archive = NewArchive(t, uint64(rawSize))
+		a, err := filesystem.NewArchive(r, "/", filesystem.WithProgress(progress.NewProgress(uint64(rawSize))))
+		if err != nil {
+			_ = r.Close()
+			return nil, errors.WrapIf(err, "server/transfer: failed to create archive")
+		}
+		t.archive = &Archive{archive: a}
 	}
 
 	return t.archive, nil
@@ -181,16 +186,6 @@ type Archive struct {
 	backupsStreamed int
 }
 
-// NewArchive returns a new archive associated with the given transfer.
-func NewArchive(t *Transfer, size uint64) *Archive {
-	return &Archive{
-		archive: &filesystem.Archive{
-			Filesystem: t.Server.Filesystem(),
-			Progress:   progress.NewProgress(size),
-		},
-		transfer: t,
-	}
-}
 
 // Stream returns a reader that can be used to stream the contents of the archive.
 func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
@@ -199,5 +194,5 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 
 // Progress returns the current progress of the archive.
 func (a *Archive) Progress() *progress.Progress {
-	return a.archive.Progress
+	return a.archive.Progress()
 }

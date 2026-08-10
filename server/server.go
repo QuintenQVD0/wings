@@ -338,7 +338,7 @@ func (s *Server) CreateEnvironment() error {
 	// create the machine-id file on install
 	if config.Get().System.MachineID.Enable {
 		if err := s.CreateMachineID(); err != nil {
-			return err
+			return errors.Wrap(err, "server: failed to write machine-id to disk")
 		}
 	}
 

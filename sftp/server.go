@@ -1,261 +1,327 @@
 package sftp
 
 import (
-	"context"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
 	"io"
-	"net"
 	"os"
-	"path"
-	"regexp"
-	"strconv"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/pkg/sftp"
-	"golang.org/x/crypto/ed25519"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/pelican-dev/wings/config"
-	"github.com/pelican-dev/wings/remote"
 	"github.com/pelican-dev/wings/server"
+	"github.com/pelican-dev/wings/server/filesystem"
 )
 
-// Usernames all follow the same format, so don't even bother hitting the API if the username is not
-// at least in the expected format. This is very basic protection against random bots finding the SFTP
-// server and sending a flood of usernames.
-var validUsernameRegexp = regexp.MustCompile(`^(?i)(.+)\.([a-z0-9]{8})$`)
+const (
+	PermissionFileRead        = "file.read"
+	PermissionFileReadContent = "file.read-content"
+	PermissionFileCreate      = "file.create"
+	PermissionFileUpdate      = "file.update"
+	PermissionFileDelete      = "file.delete"
+)
 
-//goland:noinspection GoNameStartsWithPackageName
-type SFTPServer struct {
-	manager  *server.Manager
-	BasePath string
-	ReadOnly bool
-	Listen   string
+type Handler struct {
+	mu          sync.Mutex
+	server      *server.Server
+	fs          *filesystem.Filesystem
+	events      *eventHandler
+	permissions []string
+	logger      *log.Entry
+	ro          bool
 }
 
-func New(m *server.Manager) *SFTPServer {
-	cfg := config.Get().System
-	return &SFTPServer{
-		manager:  m,
-		BasePath: cfg.Data,
-		ReadOnly: cfg.Sftp.ReadOnly,
-		Listen:   cfg.Sftp.Address + ":" + strconv.Itoa(cfg.Sftp.Port),
+// NewHandler returns a new connection handler for the SFTP server. This allows a given user
+// to access the underlying filesystem.
+func NewHandler(sc *ssh.ServerConn, srv *server.Server) (*Handler, error) {
+	uuid, ok := sc.Permissions.Extensions["user"]
+	if !ok {
+		return nil, errors.New("sftp: mismatched Wings and Panel versions — Panel 1.10 is required for this version of Wings.")
 	}
+
+	events := eventHandler{
+		ip:     sc.RemoteAddr().String(),
+		user:   uuid,
+		server: srv.ID(),
+	}
+
+	return &Handler{
+		permissions: strings.Split(sc.Permissions.Extensions["permissions"], ","),
+		server:      srv,
+		fs:          srv.Filesystem(),
+		events:      &events,
+		ro:          config.Get().System.Sftp.ReadOnly,
+		logger:      log.WithFields(log.Fields{"subsystem": "sftp", "user": uuid, "ip": sc.RemoteAddr()}),
+	}, nil
 }
 
-// Run starts the SFTP server and add a persistent listener to handle inbound
-// SFTP connections. This will automatically generate an ED25519 key if one does
-// not already exist on the system for host key verification purposes.
-func (c *SFTPServer) Run() error {
-	if _, err := os.Stat(c.PrivateKeyPath()); os.IsNotExist(err) {
-		if err := c.generateED25519PrivateKey(); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return errors.Wrap(err, "sftp: could not stat private key file")
-	}
-	pb, err := os.ReadFile(c.PrivateKeyPath())
-	if err != nil {
-		return errors.Wrap(err, "sftp: could not read private key file")
-	}
-	private, err := ssh.ParsePrivateKey(pb)
-	if err != nil {
-		return err
-	}
-
-	conf := &ssh.ServerConfig{
-		Config: ssh.Config{
-			KeyExchanges: []string{
-				"curve25519-sha256", "curve25519-sha256@libssh.org",
-				"ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521",
-				"diffie-hellman-group14-sha256",
-			},
-			Ciphers: []string{
-				"aes128-gcm@openssh.com",
-				"chacha20-poly1305@openssh.com",
-				"aes128-ctr", "aes192-ctr", "aes256-ctr",
-			},
-			MACs: []string{
-				"hmac-sha2-256-etm@openssh.com", "hmac-sha2-256",
-			},
-		},
-		NoClientAuth: false,
-		MaxAuthTries: 6,
-		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			return c.makeCredentialsRequest(conn, remote.SftpAuthPassword, string(password))
-		},
-		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			return c.makeCredentialsRequest(conn, remote.SftpAuthPublicKey, string(ssh.MarshalAuthorizedKey(key)))
-		},
-	}
-	conf.AddHostKey(private)
-
-	listener, err := net.Listen("tcp", c.Listen)
-	if err != nil {
-		return err
-	}
-
-	public := string(ssh.MarshalAuthorizedKey(private.PublicKey()))
-	log.WithField("listen", c.Listen).WithField("public_key", strings.Trim(public, "\n")).Info("sftp server listening for connections")
-
-	for {
-		if conn, _ := listener.Accept(); conn != nil {
-			go func(conn net.Conn) {
-				defer conn.Close()
-				if err := c.AcceptInbound(conn, conf); err != nil {
-					log.WithField("error", err).WithField("ip", conn.RemoteAddr().String()).Error("sftp: failed to accept inbound connection")
-				}
-			}(conn)
-		}
+// Handlers returns the sftp.Handlers for this struct.
+func (h *Handler) Handlers() sftp.Handlers {
+	return sftp.Handlers{
+		FileGet:  h,
+		FilePut:  h,
+		FileCmd:  h,
+		FileList: h,
 	}
 }
 
-// AcceptInbound handles an inbound connection to the instance and determines if we should
-// serve the request or not.
-func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) error {
-	// Before beginning a handshake must be performed on the incoming net.Conn
-	sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
-	if err != nil {
-		return errors.WithStack(err)
+// Fileread creates a reader for a file on the system and returns the reader back.
+func (h *Handler) Fileread(request *sftp.Request) (io.ReaderAt, error) {
+	// Check first if the user can actually open and view a file. This permission is named
+	// really poorly, but it is checking if they can read. There is an addition permission,
+	// "save-files" which determines if they can write that file.
+	if !h.can(PermissionFileReadContent) {
+		return nil, sftp.ErrSSHFxPermissionDenied
 	}
-	defer sconn.Close()
-	go ssh.DiscardRequests(reqs)
-
-	for ch := range chans {
-		// If not a session channel we just move on because it's not something we
-		// know how to handle at this point.
-		if ch.ChannelType() != "session" {
-			_ = ch.Reject(ssh.UnknownChannelType, "unknown channel type")
-			continue
-		}
-
-		channel, requests, err := ch.Accept()
-		if err != nil {
-			continue
-		}
-
-		go func(in <-chan *ssh.Request) {
-			for req := range in {
-				// Channels have a type that is dependent on the protocol. For SFTP
-				// this is "subsystem" with a payload that (should) be "sftp". Discard
-				// anything else we receive ("pty", "shell", etc)
-				ok := req.Type == "subsystem" && len(req.Payload) >= 4 && string(req.Payload[4:]) == "sftp"
-				_ = req.Reply(ok, nil)
-			}
-		}(requests)
-
-		if srv, ok := c.manager.Get(sconn.Permissions.Extensions["uuid"]); ok {
-			if err := c.Handle(sconn, srv, channel); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// Handle spins up a SFTP server instance for the authenticated user's server allowing
-// them access to the underlying filesystem.
-func (c *SFTPServer) Handle(conn *ssh.ServerConn, srv *server.Server, channel ssh.Channel) error {
-	handler, err := NewHandler(conn, srv)
-	if err != nil {
-		return errors.WithStackIf(err)
-	}
-
-	ctx := srv.Sftp().Context(handler.User())
-	rs := sftp.NewRequestServer(channel, handler.Handlers())
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			srv.Log().WithField("user", conn.User()).Warn("sftp: terminating active session")
-			_ = rs.Close()
-		}
-	}()
-
-	if err := rs.Serve(); err == io.EOF {
-		_ = rs.Close()
-	}
-
-	return nil
-}
-
-// Generates a new ED25519 private key that is used for host authentication when
-// a user connects to the SFTP server.
-func (c *SFTPServer) generateED25519PrivateKey() error {
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return errors.Wrap(err, "sftp: failed to generate ED25519 private key")
-	}
-	if err := os.MkdirAll(path.Dir(c.PrivateKeyPath()), 0o755); err != nil {
-		return errors.Wrap(err, "sftp: could not create internal sftp data directory")
-	}
-	o, err := os.OpenFile(c.PrivateKeyPath(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer o.Close()
-
-	b, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return errors.Wrap(err, "sftp: failed to marshal private key into bytes")
-	}
-	if err := pem.Encode(o, &pem.Block{Type: "PRIVATE KEY", Bytes: b}); err != nil {
-		return errors.Wrap(err, "sftp: failed to write ED25519 private key to disk")
-	}
-	return nil
-}
-
-func (c *SFTPServer) makeCredentialsRequest(conn ssh.ConnMetadata, t remote.SftpAuthRequestType, p string) (*ssh.Permissions, error) {
-	request := remote.SftpAuthRequest{
-		Type:          t,
-		User:          conn.User(),
-		Pass:          p,
-		IP:            conn.RemoteAddr().String(),
-		SessionID:     conn.SessionID(),
-		ClientVersion: conn.ClientVersion(),
-	}
-
-	logger := log.WithFields(log.Fields{"subsystem": "sftp", "method": request.Type, "username": request.User, "ip": request.IP})
-	logger.Debug("validating credentials for SFTP connection")
-
-	if !validUsernameRegexp.MatchString(request.User) {
-		logger.Warn("failed to validate user credentials (invalid format)")
-		return nil, &remote.SftpInvalidCredentialsError{}
-	}
-
-	if t == remote.SftpAuthPassword && config.Get().System.Sftp.KeyOnly {
-		logger.Warn("failed to validate user credentials (password authentication is disabled; only SSH keys are allowed)")
-		return nil, &remote.SftpKeyOnlyError{}
-	}
-
-	resp, err := c.manager.Client().ValidateSftpCredentials(context.Background(), request)
-	if err != nil {
-		if _, ok := err.(*remote.SftpInvalidCredentialsError); ok {
-			logger.Warn("failed to validate user credentials (invalid username or password)")
-		} else {
-			logger.WithField("error", err).Error("encountered an error while trying to validate user credentials")
-		}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.fs.IsIgnored(request.Filepath); err != nil {
 		return nil, err
 	}
-
-	logger.WithField("server", resp.Server).Debug("credentials validated and matched to server instance")
-	permissions := ssh.Permissions{
-		Extensions: map[string]string{
-			"ip":          conn.RemoteAddr().String(),
-			"uuid":        resp.Server,
-			"user":        resp.User,
-			"permissions": strings.Join(resp.Permissions, ","),
-		},
+	f, _, err := h.fs.File(request.Filepath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			h.logger.WithField("error", err).Error("error processing readfile request")
+			return nil, sftp.ErrSSHFxFailure
+		}
+		return nil, sftp.ErrSSHFxNoSuchFile
 	}
-
-	return &permissions, nil
+	return f, nil
 }
 
-// PrivateKeyPath returns the path the host private key for this server instance.
-func (c *SFTPServer) PrivateKeyPath() string {
-	return path.Join(c.BasePath, ".sftp/id_ed25519")
+// Filewrite handles the write actions for a file on the system.
+func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
+	if h.ro {
+		return nil, sftp.ErrSSHFxOpUnsupported
+	}
+	l := h.logger.WithField("source", request.Filepath)
+	// If the user doesn't have enough space left on the server it should respond with an
+	// error since we won't be letting them write this file to the disk.
+	if !h.fs.HasSpaceAvailable(true) {
+		return nil, ErrSSHQuotaExceeded
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if err := h.fs.IsIgnored(request.Filepath); err != nil {
+		return nil, err
+	}
+	// The specific permission required to perform this action. If the file exists on the
+	// system already it only needs to be an update, otherwise we'll check for a create.
+	permission := PermissionFileUpdate
+	_, sterr := h.fs.Stat(request.Filepath)
+	if sterr != nil {
+		if !errors.Is(sterr, os.ErrNotExist) {
+			l.WithField("error", sterr).Error("error while getting file reader")
+			return nil, sftp.ErrSSHFxFailure
+		}
+		permission = PermissionFileCreate
+	}
+	// Confirm the user has permission to perform this action BEFORE calling Touch, otherwise
+	// you'll potentially create a file on the system and then fail out because of user
+	// permission checking after the fact.
+	if !h.can(permission) {
+		return nil, sftp.ErrSSHFxPermissionDenied
+	}
+	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
+		return nil, sftp.ErrSSHFxFailure
+	}
+	// Chown may or may not have been called in the touch function, so always do
+	// it at this point to avoid the file being improperly owned.
+	_ = h.fs.Chown(request.Filepath)
+	event := server.ActivitySftpWrite
+	if permission == PermissionFileCreate {
+		event = server.ActivitySftpCreate
+	}
+	h.events.MustLog(event, FileAction{Entity: request.Filepath})
+	return f, nil
+}
+
+// Filecmd hander for basic SFTP system calls related to files, but not anything to do with reading
+// or writing to those files.
+func (h *Handler) Filecmd(request *sftp.Request) error {
+	if h.ro {
+		return sftp.ErrSSHFxOpUnsupported
+	}
+	l := h.logger.WithField("source", request.Filepath)
+	if request.Target != "" {
+		l = l.WithField("target", request.Target)
+	}
+
+	if err := h.fs.IsIgnored(request.Filepath); err != nil {
+		return err
+	}
+
+	switch request.Method {
+	// Allows a user to make changes to the permissions of a given file or directory
+	// on their server using their SFTP client.
+	case "Setstat":
+		if !h.can(PermissionFileUpdate) {
+			return sftp.ErrSSHFxPermissionDenied
+		}
+		mode := request.Attributes().FileMode().Perm()
+		// If the client passes an invalid FileMode just use the default 0644.
+		if mode == 0o000 {
+			mode = os.FileMode(0o644)
+		}
+		// Force directories to be 0755.
+		if request.Attributes().FileMode().IsDir() {
+			mode = 0o755
+		}
+		if err := h.fs.Chmod(request.Filepath, mode); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return sftp.ErrSSHFxNoSuchFile
+			}
+			l.WithField("error", err).Error("failed to perform setstat on item")
+			return sftp.ErrSSHFxFailure
+		}
+		break
+	// Support renaming a file (aka Move).
+	case "Rename":
+		if !h.can(PermissionFileUpdate) {
+			return sftp.ErrSSHFxPermissionDenied
+		}
+		if err := h.fs.Rename(request.Filepath, request.Target); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return sftp.ErrSSHFxNoSuchFile
+			}
+			l.WithField("error", err).Error("failed to rename file")
+			return sftp.ErrSSHFxFailure
+		}
+		h.events.MustLog(server.ActivitySftpRename, FileAction{Entity: request.Filepath, Target: request.Target})
+		break
+	// Handle deletion of a directory. This will properly delete all of the files and
+	// folders within that directory if it is not already empty (unlike a lot of SFTP
+	// clients that must delete each file individually).
+	case "Rmdir":
+		if !h.can(PermissionFileDelete) {
+			return sftp.ErrSSHFxPermissionDenied
+		}
+		p := filepath.Clean(request.Filepath)
+		if err := h.fs.Delete(p); err != nil {
+			l.WithField("error", err).Error("failed to remove directory")
+			return sftp.ErrSSHFxFailure
+		}
+		h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
+		return sftp.ErrSSHFxOk
+	// Handle requests to create a new Directory.
+	case "Mkdir":
+		if !h.can(PermissionFileCreate) {
+			return sftp.ErrSSHFxPermissionDenied
+		}
+		name := strings.Split(filepath.Clean(request.Filepath), "/")
+		p := strings.Join(name[0:len(name)-1], "/")
+		if err := h.fs.CreateDirectory(name[len(name)-1], p); err != nil {
+			l.WithField("error", err).Error("failed to create directory")
+			return sftp.ErrSSHFxFailure
+		}
+		h.events.MustLog(server.ActivitySftpCreateDirectory, FileAction{Entity: request.Filepath})
+		break
+	// Support creating symlinks between files. The source and target must resolve within
+	// the server home directory.
+	case "Symlink":
+		if !h.can(PermissionFileCreate) {
+			return sftp.ErrSSHFxPermissionDenied
+		}
+		if err := h.fs.Symlink(request.Filepath, request.Target); err != nil {
+			l.WithField("target", request.Target).WithField("error", err).Error("failed to create symlink")
+			return sftp.ErrSSHFxFailure
+		}
+		break
+	// Called when deleting a file.
+	case "Remove":
+		if !h.can(PermissionFileDelete) {
+			return sftp.ErrSSHFxPermissionDenied
+		}
+		if err := h.fs.Delete(request.Filepath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return sftp.ErrSSHFxNoSuchFile
+			}
+			l.WithField("error", err).Error("failed to remove a file")
+			return sftp.ErrSSHFxFailure
+		}
+		h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
+		return sftp.ErrSSHFxOk
+	default:
+		return sftp.ErrSSHFxOpUnsupported
+	}
+
+	target := request.Filepath
+	if request.Target != "" {
+		target = request.Target
+	}
+	// Not failing here is intentional. We still made the file, it is just owned incorrectly
+	// and will likely cause some issues. There is no logical check for if the file was removed
+	// because both of those cases (Rmdir, Remove) have an explicit return rather than break.
+	if err := h.fs.Chown(target); err != nil {
+		l.WithField("error", err).Warn("error chowning file")
+	}
+
+	return sftp.ErrSSHFxOk
+}
+
+// Filelist is the handler for SFTP filesystem list calls. This will handle calls to list the contents of
+// a directory as well as perform file/folder stat calls.
+func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
+	if !h.can(PermissionFileRead) {
+		return nil, sftp.ErrSSHFxPermissionDenied
+	}
+
+	switch request.Method {
+	case "List":
+		d, err := h.fs.ReadDir(request.Filepath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, sftp.ErrSSHFxNoSuchFile
+			}
+			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error while listing directory")
+			return nil, sftp.ErrSSHFxFailure
+		}
+		files := make([]os.FileInfo, len(d))
+		for _, entry := range d {
+			if i, err := entry.Info(); err == nil {
+				files = append(files, i)
+			}
+		}
+		return ListerAt(files), nil
+	case "Stat":
+		st, err := h.fs.Stat2(request.Filepath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, sftp.ErrSSHFxNoSuchFile
+			}
+			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error performing stat on file")
+			return nil, sftp.ErrSSHFxFailure
+		}
+		return ListerAt([]os.FileInfo{st}), nil
+	default:
+		return nil, sftp.ErrSSHFxOpUnsupported
+	}
+}
+
+// Determines if a user has permission to perform a specific action on the SFTP server. These
+// permissions are defined and returned by the Panel API.
+func (h *Handler) can(permission string) bool {
+	if h.server.IsSuspended() {
+		return false
+	}
+	for _, p := range h.permissions {
+		// If we match the permission specifically, or the user has been granted the "*"
+		// permission because they're an admin, let them through.
+		if p == permission || p == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) User() string {
+	return h.events.user
 }
