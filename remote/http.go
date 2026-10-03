@@ -41,7 +41,7 @@ type Client interface {
 type client struct {
 	httpClient  *http.Client
 	baseUrl     string
-	mu          sync.RWMutex	
+	mu          sync.RWMutex
 	tokenId     string
 	token       string
 	maxAttempts int
