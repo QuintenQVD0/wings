@@ -92,7 +92,7 @@ func escapeIgnorePattern(line string) (string, int) {
 		case '*':
 			wildcards++
 			b.WriteByte(c)
-		case '(', ')', '{', '}', '|', '+':
+		case '(', ')', '{', '}', '|', '+', '^', '$':
 			b.WriteByte('\\')
 			b.WriteByte(c)
 		default:
