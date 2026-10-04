@@ -9,7 +9,7 @@ import (
 )
 
 // Limits applied to the gitignore-style pattern lists used by an Archive, whether they
-// come from the Panel with a backup request or from a server's .pteroignore file.
+// come from the Panel with a backup request or from a server's .pelicanignore file.
 const (
 	// MaxIgnoreLength is the maximum size, in bytes, of a pattern list.
 	MaxIgnoreLength = 32 * 1024

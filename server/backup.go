@@ -53,7 +53,7 @@ func (s *Server) getServerwideIgnoredFiles() (string, error) {
 		return "", err
 	}
 	if err := filesystem.ValidateIgnore(string(b)); err != nil {
-		return "", errors.WrapIf(err, "backup: invalid .pteroignore file")
+		return "", errors.WrapIf(err, "backup: invalid .pelicanignore file")
 	}
 	return string(b), nil
 }
