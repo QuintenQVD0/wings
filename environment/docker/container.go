@@ -138,7 +138,7 @@ func (e *Environment) InSituUpdate() error {
 		return errors.Wrap(err, "environment/docker: could not update container")
         e.applyCpuBurst(ctx)
 		return errors.Wrap(err, "environment/docker: could not update container")
-	
+	}
 	e.applyCpuBurst(ctx)
 	return nil
 }
