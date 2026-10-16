@@ -130,7 +130,11 @@ func (l Limits) AsContainerResources() container.Resources {
 	if l.CpuLimit > 0 {
 		cfg := config.Get().Docker
 		period := cfg.CpuPeriodMicroseconds()
-		resources.CPUQuota = l.CpuLimit * period / 100
+		quota := l.CpuLimit * period / 100
+			if quota < 1_000 {
+				quota = 1_000
+			}
+        resources.CPUQuota = quota
 		resources.CPUPeriod = period
 		resources.CPUShares = cfg.CpuShares
 	}
