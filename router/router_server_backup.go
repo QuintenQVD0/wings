@@ -21,6 +21,7 @@ import (
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/server"
 	"github.com/pelican/wings/server/backup"
+	"github.com/pelican/wings/server/filesystem"
 )
 
 var blockedBackupRestorePrefixes = []netip.Prefix{
@@ -53,6 +54,12 @@ func postServerBackup(c *gin.Context) {
 	if !ok {
 		return
 	}
+
+	if err := filesystem.ValidateIgnore(data.Ignore); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	var adapter backup.BackupInterface
 	switch data.Adapter {
 	case backup.LocalBackupAdapter:
